@@ -718,15 +718,39 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 
     /// Handle ground dispatch of print/execute for all characters in a string.
+    ///
+    /// Runs of printable ASCII go to [`Perform::print_ascii`] in one call.
     #[inline]
-    fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
-        for c in text.chars() {
-            match c {
-                '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
-                _ => performer.print(c),
+    fn ground_dispatch<P: Perform>(performer: &mut P, mut text: &str) {
+        while !text.is_empty() {
+            let run = text.bytes().position(|b| !is_printable_ascii(b)).unwrap_or(text.len());
+            if run > 0 {
+                // An ASCII byte always ends on a char boundary.
+                let (ascii, rest) = text.split_at(run);
+                performer.print_ascii(ascii);
+                text = rest;
+                continue;
             }
+
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
+                    _ => performer.print(c),
+                }
+                if matches!(chars.as_str().bytes().next(), Some(b) if is_printable_ascii(b)) {
+                    break;
+                }
+            }
+            text = chars.as_str();
         }
     }
+}
+
+/// Whether `byte` is printable ASCII, from space through `~`.
+#[inline(always)]
+fn is_printable_ascii(byte: u8) -> bool {
+    matches!(byte, 0x20..=0x7E)
 }
 
 #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
@@ -761,6 +785,21 @@ enum State {
 pub trait Perform {
     /// Draw a character to the screen and update states.
     fn print(&mut self, _c: char) {}
+
+    /// Draw a run of printable ASCII (space through `~`) to the screen.
+    ///
+    /// This is equivalent to calling [`Perform::print`] for every character
+    /// in `text`, which is what the default implementation does. Overriding
+    /// it lets a performer write a whole run at once.
+    ///
+    /// One run of text may arrive over several calls, for example when it is
+    /// split across calls to [`Parser::advance`].
+    #[inline]
+    fn print_ascii(&mut self, text: &str) {
+        for c in text.chars() {
+            self.print(c);
+        }
+    }
 
     /// Execute a C0 or C1 control function.
     fn execute(&mut self, _byte: u8) {}
@@ -831,6 +870,7 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
+    use std::string::String;
     use std::vec::Vec;
 
     use super::*;
@@ -1538,5 +1578,62 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 2);
         assert_eq!(dispatcher.dispatched[0], Sequence::Execute(0x18));
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
+    }
+
+    /// Records ASCII runs as they arrive, and everything else like
+    /// `Dispatcher`.
+    #[derive(Default)]
+    struct RunDispatcher {
+        runs: Vec<String>,
+        inner: Dispatcher,
+    }
+
+    impl Perform for RunDispatcher {
+        fn print_ascii(&mut self, text: &str) {
+            assert!(text.bytes().all(is_printable_ascii), "{text:?}");
+            self.runs.push(text.into());
+            self.inner.print_ascii(text);
+        }
+
+        fn print(&mut self, c: char) {
+            self.inner.print(c);
+        }
+
+        fn execute(&mut self, byte: u8) {
+            self.inner.execute(byte);
+        }
+
+        fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
+            self.inner.csi_dispatch(params, intermediates, ignore, c);
+        }
+    }
+
+    #[test]
+    fn print_ascii_receives_whole_runs() {
+        let mut dispatcher = RunDispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, "ab c\tdé~f\x1b[1mgh\x7fi".as_bytes());
+
+        assert_eq!(dispatcher.runs, ["ab c", "d", "~f", "gh", "i"]);
+    }
+
+    #[test]
+    fn print_ascii_matches_printing_each_char() {
+        let input = b"plain \x1b[31mred\x1b[0m t\xc3\xa9xt \xf0\x9f\x98\x80!\r\n\x7f\xc2\x85\xc3";
+
+        for split in 0..=input.len() {
+            let mut expected = Dispatcher::default();
+            let mut parser = Parser::new();
+            parser.advance(&mut expected, &input[..split]);
+            parser.advance(&mut expected, &input[split..]);
+
+            let mut dispatcher = RunDispatcher::default();
+            let mut parser = Parser::new();
+            parser.advance(&mut dispatcher, &input[..split]);
+            parser.advance(&mut dispatcher, &input[split..]);
+
+            assert_eq!(dispatcher.inner.dispatched, expected.dispatched, "split at {split}");
+        }
     }
 }
