@@ -4,6 +4,10 @@ CHANGELOG
 ## Unreleased
 
 - Add `Perform::print_ascii`, which receives runs of printable ASCII at once
+- Invalid UTF-8 in ground no longer rescans the rest of the buffer, which was quadratic
+- C1 controls split across calls to `advance` are executed instead of printed
+- CAN and SUB abandon an OSC string instead of dispatching it truncated
+- `ParamsIter::size_hint` lower bound no longer counts subparameters
 - Removed the `ansi` module, the `ansi` and `serde` features, `Parser::advance_until_terminated` and `Perform::terminated`
 
 ## 0.15.0

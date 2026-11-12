@@ -116,8 +116,10 @@ impl<'a> Iterator for ParamsIter<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
+        // Subparameters are counted in `remaining`, but each parameter yields
+        // one item, so only the upper bound is exact.
         let remaining = self.params.len() - self.index;
-        (remaining, Some(remaining))
+        (usize::from(remaining > 0), Some(remaining))
     }
 }
 

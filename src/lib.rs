@@ -21,7 +21,8 @@
 //!
 //! * UTF-8 Support for Input
 //! * OSC Strings can be terminated by 0x07
-//! * Only supports 7-bit codes
+//! * C1 controls are executed when they arrive as raw bytes, but escape
+//!   sequences are 7-bit only
 //!
 //! [`Parser`]: struct.Parser.html
 //! [`Perform`]: trait.Perform.html
@@ -30,7 +31,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-use core::mem::MaybeUninit;
 use core::str;
 
 #[cfg(not(feature = "std"))]
@@ -369,7 +369,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.state = State::Ground
             },
             0x18 | 0x1A => {
-                self.osc_end(performer, byte);
+                // CAN and SUB abandon the string instead of dispatching it.
+                self.osc_raw.clear();
+                self.osc_num_params = 0;
                 performer.execute(byte);
                 self.state = State::Ground
             },
@@ -530,19 +532,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// The aliasing is needed here for multiple slices into self.osc_raw
     #[inline]
     fn osc_dispatch<P: Perform>(&self, performer: &mut P, byte: u8) {
-        let mut slices: [MaybeUninit<&[u8]>; MAX_OSC_PARAMS] =
-            unsafe { MaybeUninit::uninit().assume_init() };
-
-        for (i, slice) in slices.iter_mut().enumerate().take(self.osc_num_params) {
-            let indices = self.osc_params[i];
-            *slice = MaybeUninit::new(&self.osc_raw[indices.0..indices.1]);
+        let mut slices: [&[u8]; MAX_OSC_PARAMS] = [&[]; MAX_OSC_PARAMS];
+        let params = &self.osc_params[..self.osc_num_params];
+        for (slice, &(start, end)) in slices.iter_mut().zip(params) {
+            *slice = &self.osc_raw[start..end];
         }
-
-        unsafe {
-            let num_params = self.osc_num_params;
-            let params = &slices[..num_params] as *const [MaybeUninit<&[u8]>] as *const [&[u8]];
-            performer.osc_dispatch(&*params, byte == 0x07);
-        }
+        performer.osc_dispatch(&slices[..self.osc_num_params], byte == 0x07);
     }
 
     /// Advance the parser state from ground.
@@ -563,64 +558,64 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             return 1;
         }
 
-        match str::from_utf8(&bytes[..plain_chars]) {
-            Ok(parsed) => {
-                Self::ground_dispatch(performer, parsed);
-                let mut processed = plain_chars;
+        // Dispatch everything up to the escape. Invalid UTF-8 is skipped in
+        // place, so the bytes after it are not searched for ESC again.
+        let mut pos = 0;
+        loop {
+            let err = match str::from_utf8(&bytes[pos..plain_chars]) {
+                Ok(parsed) => {
+                    Self::ground_dispatch(performer, parsed);
+                    break;
+                },
+                Err(err) => err,
+            };
 
-                // If there's another character, it must be escape so process it
-                // directly.
-                if processed < num_bytes {
-                    self.state = State::Escape;
-                    self.reset_params();
-                    processed += 1;
-                }
+            // Dispatch all the valid bytes.
+            let valid_bytes = pos + err.valid_up_to();
+            // SAFETY: `from_utf8` validated the bytes up to `valid_bytes`.
+            let parsed = unsafe { str::from_utf8_unchecked(&bytes[pos..valid_bytes]) };
+            Self::ground_dispatch(performer, parsed);
 
-                processed
-            },
-            // Handle invalid and partial utf8.
-            Err(err) => {
-                // Dispatch all the valid bytes.
-                let valid_bytes = err.valid_up_to();
-                let parsed = unsafe { str::from_utf8_unchecked(&bytes[..valid_bytes]) };
-                Self::ground_dispatch(performer, parsed);
+            match err.error_len() {
+                Some(len) => {
+                    // Execute C1 escapes or emit replacement character.
+                    if len == 1 && bytes[valid_bytes] <= 0x9F {
+                        performer.execute(bytes[valid_bytes]);
+                    } else {
+                        performer.print('�');
+                    }
 
-                match err.error_len() {
-                    Some(len) => {
-                        // Execute C1 escapes or emit replacement character.
-                        if len == 1 && bytes[valid_bytes] <= 0x9F {
-                            performer.execute(bytes[valid_bytes]);
-                        } else {
-                            performer.print('�');
-                        }
+                    // Continue after the invalid bytes.
+                    pos = valid_bytes + len;
+                },
+                None => {
+                    if plain_chars < num_bytes {
+                        // Process bytes cut off by escape.
+                        performer.print('�');
+                        self.state = State::Escape;
+                        self.reset_params();
+                        return plain_chars + 1;
+                    }
 
-                        // Restart processing after the invalid bytes.
-                        //
-                        // While we could theoretically try to just re-parse
-                        // `bytes[valid_bytes + len..plain_chars]`, it's easier
-                        // to just skip it and invalid utf8 is pretty rare
-                        // anyway.
-                        valid_bytes + len
-                    },
-                    None => {
-                        if plain_chars < num_bytes {
-                            // Process bytes cut off by escape.
-                            performer.print('�');
-                            self.state = State::Escape;
-                            self.reset_params();
-                            plain_chars + 1
-                        } else {
-                            // Process bytes cut off by the buffer end.
-                            let extra_bytes = num_bytes - valid_bytes;
-                            let partial_len = self.partial_utf8_len + extra_bytes;
-                            self.partial_utf8[self.partial_utf8_len..partial_len]
-                                .copy_from_slice(&bytes[valid_bytes..valid_bytes + extra_bytes]);
-                            self.partial_utf8_len = partial_len;
-                            num_bytes
-                        }
-                    },
-                }
-            },
+                    // Keep the bytes cut off by the buffer end for the next
+                    // call. `partial_utf8` is always empty here, since
+                    // `advance_partial_utf8` drains it before ground runs.
+                    let extra_bytes = num_bytes - valid_bytes;
+                    self.partial_utf8[..extra_bytes].copy_from_slice(&bytes[valid_bytes..]);
+                    self.partial_utf8_len = extra_bytes;
+                    return num_bytes;
+                },
+            }
+        }
+
+        // If there's another character, it must be escape so process it
+        // directly.
+        if plain_chars < num_bytes {
+            self.state = State::Escape;
+            self.reset_params();
+            plain_chars + 1
+        } else {
+            plain_chars
         }
     }
 
@@ -639,8 +634,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             // If the entire buffer is valid, use the first character and
             // continue parsing.
             Ok(parsed) => {
+                // SAFETY: `partial_utf8_len` is never 0 here, so `parsed` holds
+                // at least one character.
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                performer.print(c);
+                Self::dispatch_char(performer, c);
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -651,12 +648,14 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 // another utf8 character into `partial_utf8`. Since we only
                 // care about the first character, we just ignore the rest.
                 if valid_bytes > 0 {
+                    // SAFETY: `from_utf8` validated the first `valid_bytes`
+                    // bytes, and there is at least one of them.
                     let c = unsafe {
                         let parsed = str::from_utf8_unchecked(&self.partial_utf8[..valid_bytes]);
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    performer.print(c);
+                    Self::dispatch_char(performer, c);
 
                     self.partial_utf8_len = 0;
                     return valid_bytes - old_bytes;
@@ -685,7 +684,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, mut text: &str) {
         while !text.is_empty() {
-            let run = text.bytes().position(|b| !is_printable_ascii(b)).unwrap_or(text.len());
+            let run = printable_ascii_run(text.as_bytes());
             if run > 0 {
                 // An ASCII byte always ends on a char boundary.
                 let (ascii, rest) = text.split_at(run);
@@ -696,15 +695,22 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
             let mut chars = text.chars();
             while let Some(c) = chars.next() {
-                match c {
-                    '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
-                    _ => performer.print(c),
-                }
+                Self::dispatch_char(performer, c);
                 if matches!(chars.as_str().bytes().next(), Some(b) if is_printable_ascii(b)) {
                     break;
                 }
             }
             text = chars.as_str();
+        }
+    }
+
+    /// Dispatch one character from ground: C0 and C1 controls are executed,
+    /// everything else is printed.
+    #[inline(always)]
+    fn dispatch_char<P: Perform>(performer: &mut P, c: char) {
+        match c {
+            '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
+            _ => performer.print(c),
         }
     }
 }
@@ -713,6 +719,22 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 #[inline(always)]
 fn is_printable_ascii(byte: u8) -> bool {
     matches!(byte, 0x20..=0x7E)
+}
+
+/// Length of the leading run of printable ASCII in `bytes`.
+#[inline]
+fn printable_ascii_run(bytes: &[u8]) -> usize {
+    // Whole blocks are checked without an early exit so the loop vectorizes;
+    // the tail and the block that ended the run are scanned byte by byte.
+    let mut len = 0;
+    for block in bytes.chunks_exact(16) {
+        if !block.iter().all(|&b| is_printable_ascii(b)) {
+            break;
+        }
+        len += block.len();
+    }
+    let tail = &bytes[len..];
+    len + tail.iter().position(|&b| !is_printable_ascii(b)).unwrap_or(tail.len())
 }
 
 #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
@@ -1493,6 +1515,97 @@ mod tests {
         assert_eq!(dispatcher.dispatched[1], Sequence::Esc(Vec::new(), false, b'0'));
         assert_eq!(dispatcher.dispatched[2], Sequence::Print('1'));
         assert_eq!(dispatcher.dispatched[3], Sequence::Print('2'));
+    }
+
+    #[test]
+    fn invalid_utf8_runs() {
+        // Several invalid sequences before an escape, so skipping one must
+        // continue with the next instead of rescanning for the escape.
+        const INPUT: &[u8] = b"a\xFF\xFEb\xE2\x82c\x1b[m";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, INPUT);
+
+        assert_eq!(
+            dispatcher.dispatched,
+            [
+                Sequence::Print('a'),
+                Sequence::Print('�'),
+                Sequence::Print('�'),
+                Sequence::Print('b'),
+                Sequence::Print('�'),
+                Sequence::Print('c'),
+                Sequence::Csi(vec![vec![0]], vec![], false, 'm'),
+            ]
+        );
+    }
+
+    #[test]
+    fn c1_split_across_advances() {
+        // U+0085 (NEL) encoded as UTF-8 is executed, however it arrives.
+        const INPUT: &[u8] = b"\xC2\x85a";
+
+        for split in 0..=INPUT.len() {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+
+            parser.advance(&mut dispatcher, &INPUT[..split]);
+            parser.advance(&mut dispatcher, &INPUT[split..]);
+
+            assert_eq!(
+                dispatcher.dispatched,
+                [Sequence::Execute(0x85), Sequence::Print('a')],
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc_cancelled_by_can() {
+        const INPUT: &[u8] = b"\x1b]2;abc\x18\x1b]0;x\x07";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, INPUT);
+
+        assert_eq!(
+            dispatcher.dispatched,
+            [Sequence::Execute(0x18), Sequence::Osc(vec![b"0".to_vec(), b"x".to_vec()], true),]
+        );
+    }
+
+    #[test]
+    fn params_size_hint_counts_parameters() {
+        struct Hint(Option<(usize, Option<usize>)>);
+
+        impl Perform for Hint {
+            fn csi_dispatch(&mut self, params: &Params, _: &[u8], _: bool, _: char) {
+                self.0 = Some(params.iter().size_hint());
+            }
+        }
+
+        let mut hint = Hint(None);
+        let mut parser = Parser::new();
+
+        parser.advance(&mut hint, b"\x1b[38:2:1:2:3m");
+
+        assert_eq!(hint.0, Some((1, Some(5))));
+    }
+
+    #[test]
+    fn printable_ascii_run_lengths() {
+        let long = [b'a'; 40];
+        assert_eq!(printable_ascii_run(&long), 40);
+        assert_eq!(printable_ascii_run(b""), 0);
+        assert_eq!(printable_ascii_run(b"\n"), 0);
+        for stop in 0..40 {
+            let mut bytes = long;
+            bytes[stop] = b'\n';
+            assert_eq!(printable_ascii_run(&bytes), stop, "stop at {stop}");
+        }
     }
 
     #[test]
