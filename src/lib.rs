@@ -38,9 +38,6 @@ use arrayvec::ArrayVec;
 
 mod params;
 
-#[cfg(feature = "ansi")]
-#[cfg_attr(docsrs, doc(cfg(feature = "ansi")))]
-pub mod ansi;
 pub use params::{Params, ParamsIter};
 
 const MAX_INTERMEDIATES: usize = 2;
@@ -93,11 +90,6 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 
     #[inline]
-    fn params(&self) -> &Params {
-        &self.params
-    }
-
-    #[inline]
     fn intermediates(&self) -> &[u8] {
         &self.intermediates[..self.intermediate_idx]
     }
@@ -127,43 +119,6 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 },
             }
         }
-    }
-
-    /// Partially advance the parser state.
-    ///
-    /// This is equivalent to [`Self::advance`], but stops when
-    /// [`Perform::terminated`] is true after reading a byte.
-    ///
-    /// Returns the number of bytes read before termination.
-    ///
-    /// See [`Self::advance`] for more details.
-    #[inline]
-    #[must_use = "Returned value should be used to processs the remaining bytes"]
-    pub fn advance_until_terminated<P: Perform>(
-        &mut self,
-        performer: &mut P,
-        bytes: &[u8],
-    ) -> usize {
-        let mut i = 0;
-
-        // Handle partial codepoints from previous calls to `advance`.
-        if self.partial_utf8_len != 0 {
-            i += self.advance_partial_utf8(performer, bytes);
-        }
-
-        while i != bytes.len() && !performer.terminated() {
-            match self.state {
-                State::Ground => i += self.advance_ground(performer, &bytes[i..]),
-                _ => {
-                    // Inlining it results in worse codegen.
-                    let byte = bytes[i];
-                    self.change_state(performer, byte);
-                    i += 1;
-                },
-            }
-        }
-
-        i
     }
 
     #[inline(always)]
@@ -458,7 +413,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         } else {
             self.params.push(self.param);
         }
-        performer.csi_dispatch(self.params(), self.intermediates(), self.ignoring, byte as char);
+        performer.csi_dispatch(&self.params, self.intermediates(), self.ignoring, byte as char);
 
         self.state = State::Ground
     }
@@ -470,7 +425,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         } else {
             self.params.push(self.param);
         }
-        performer.hook(self.params(), self.intermediates(), self.ignoring, byte as char);
+        performer.hook(&self.params, self.intermediates(), self.ignoring, byte as char);
         self.state = State::DcsPassthrough;
     }
 
@@ -856,19 +811,6 @@ pub trait Perform {
     /// The `ignore` flag indicates that more than two intermediates arrived and
     /// subsequent characters were ignored.
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
-
-    /// Whether the parser should terminate prematurely.
-    ///
-    /// This can be used in conjunction with
-    /// [`Parser::advance_until_terminated`] to terminate the parser after
-    /// receiving certain escape sequences like synchronized updates.
-    ///
-    /// This is checked after every parsed byte, so no expensive computation
-    /// should take place in this function.
-    #[inline(always)]
-    fn terminated(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(all(test, not(feature = "std")))]

@@ -4,6 +4,7 @@ CHANGELOG
 ## Unreleased
 
 - Add `Perform::print_ascii`, which receives runs of printable ASCII at once
+- Removed the `ansi` module, the `ansi` and `serde` features, `Parser::advance_until_terminated` and `Perform::terminated`
 
 ## 0.15.0
 
