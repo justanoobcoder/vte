@@ -658,7 +658,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     Self::dispatch_char(performer, c);
 
                     self.partial_utf8_len = 0;
-                    return valid_bytes - old_bytes;
+                    // Only that character is consumed; what follows it in
+                    // the buffer is still in `bytes` and is parsed again.
+                    return c.len_utf8() - old_bytes;
                 }
 
                 match err.error_len() {
@@ -1540,6 +1542,33 @@ mod tests {
                 Sequence::Csi(vec![vec![0]], vec![], false, 'm'),
             ]
         );
+    }
+
+    #[test]
+    fn bytes_after_a_completed_partial_character_are_kept() {
+        // "é", then "a" and an invalid byte within the 4-byte partial
+        // buffer: only the "é" is taken from it.
+        const INPUT: &[u8] = b"\xC3\xA9a\xFFbc";
+
+        for split in 0..=INPUT.len() {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+
+            parser.advance(&mut dispatcher, &INPUT[..split]);
+            parser.advance(&mut dispatcher, &INPUT[split..]);
+
+            assert_eq!(
+                dispatcher.dispatched,
+                [
+                    Sequence::Print('é'),
+                    Sequence::Print('a'),
+                    Sequence::Print('�'),
+                    Sequence::Print('b'),
+                    Sequence::Print('c'),
+                ],
+                "split at {split}"
+            );
+        }
     }
 
     #[test]
