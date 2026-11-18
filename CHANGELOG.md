@@ -11,6 +11,7 @@ CHANGELOG
 - Faster CSI parsing
 - Add `Perform::put_slice`, which receives runs of device control string data at once
 - Faster OSC and DCS parsing
+- Faster parsing of plain text between escape sequences
 - `ParamsIter::size_hint` lower bound no longer counts subparameters
 - Removed the `ansi` module, the `ansi` and `serde` features, `Parser::advance_until_terminated` and `Perform::terminated`
 

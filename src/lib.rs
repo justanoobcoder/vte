@@ -632,9 +632,17 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             return 1;
         }
 
+        // Printable ASCII needs no UTF-8 validation. Between the sequences of
+        // colored output, it is often all there is up to the escape.
+        let mut pos = 0;
+        if is_printable_ascii(bytes[0]) {
+            pos = printable_ascii_run(&bytes[..plain_chars]);
+            // SAFETY: printable ASCII is valid UTF-8.
+            performer.print_ascii(unsafe { str::from_utf8_unchecked(&bytes[..pos]) });
+        }
+
         // Dispatch everything up to the escape. Invalid UTF-8 is skipped in
         // place, so the bytes after it are not searched for ESC again.
-        let mut pos = 0;
         loop {
             let err = match str::from_utf8(&bytes[pos..plain_chars]) {
                 Ok(parsed) => {
@@ -1822,6 +1830,23 @@ mod tests {
         parser.advance(&mut dispatcher, b"\x1bPq#0;2\x7f!3~\n-\xff$\x1b\\");
 
         assert_eq!(dispatcher.puts, [&b"#0;2"[..], b"!3~\n-", b"$"]);
+    }
+
+    #[test]
+    fn ground_matches_feeding_one_byte_at_a_time() {
+        let input: &[u8] = b"plain\x1b[1mab\xc3\xa9cd\x1b[mx\xff\xfey\r\n\xc2\x85z\x1b[m\
+            \xe6\xbc\xa2\x1b[m~ \x7f!\xf0\x9f\x91\x8d\xe2\x82\x1b[mend\xc3";
+
+        let mut expected = Dispatcher::default();
+        let mut parser = Parser::new();
+        for byte in input.chunks(1) {
+            parser.advance(&mut expected, byte);
+        }
+
+        let mut dispatcher = Dispatcher::default();
+        Parser::new().advance(&mut dispatcher, input);
+
+        assert_eq!(dispatcher.dispatched, expected.dispatched);
     }
 
     #[test]
