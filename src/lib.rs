@@ -111,6 +111,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                State::CsiEntry | State::CsiParam => {
+                    i += self.advance_csi_params(performer, &bytes[i..])
+                },
+                State::DcsPassthrough => i += self.advance_dcs_data(performer, &bytes[i..]),
+                State::OscString => i += self.advance_osc_data(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -139,6 +144,62 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::SosPmApcString => self.anywhere(performer, byte),
             State::Ground => unreachable!(),
         }
+    }
+
+    /// Advance through the parameters and final byte of a CSI sequence.
+    ///
+    /// Digits, separators and the final byte, which make up nearly every CSI
+    /// sequence, are handled in one loop instead of one state change per
+    /// byte. The first other byte goes through the state machine and ends
+    /// the loop. Returns the number of bytes consumed.
+    #[inline]
+    fn advance_csi_params<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        for (i, &byte) in bytes.iter().enumerate() {
+            match byte {
+                0x30..=0x39 => self.action_paramnext(byte),
+                0x3A => self.action_subparam(),
+                0x3B => self.action_param(),
+                0x40..=0x7E => {
+                    self.action_csi_dispatch(performer, byte);
+                    return i + 1;
+                },
+                _ => {
+                    self.change_state(performer, byte);
+                    return i + 1;
+                },
+            }
+            self.state = State::CsiParam;
+        }
+        bytes.len()
+    }
+
+    /// Advance through the data of a device control string, passing each run
+    /// of it to [`Perform::put_slice`] at once. Returns the number of bytes
+    /// consumed.
+    #[inline]
+    fn advance_dcs_data<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        // The bytes `advance_dcs_passthrough` puts.
+        let run = leading_run(bytes, |b| matches!(b, 0x00..=0x17 | 0x19 | 0x1C..=0x7E));
+        if run == 0 {
+            self.advance_dcs_passthrough(performer, bytes[0]);
+            return 1;
+        }
+        performer.put_slice(&bytes[..run]);
+        run
+    }
+
+    /// Advance through an OSC string, copying each run of it between
+    /// separators and controls at once. Returns the number of bytes consumed.
+    #[inline]
+    fn advance_osc_data<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        // The bytes `advance_osc_string` stores, except separators.
+        let run = leading_run(bytes, |b| b >= 0x20 && b != b';');
+        if run == 0 {
+            self.advance_osc_string(performer, bytes[0]);
+            return 1;
+        }
+        self.action_osc_put_slice(&bytes[..run]);
+        run
     }
 
     #[inline(always)]
@@ -510,6 +571,19 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         self.osc_raw.push(byte);
     }
 
+    #[inline]
+    fn action_osc_put_slice(&mut self, bytes: &[u8]) {
+        #[cfg(not(feature = "std"))]
+        {
+            // Like `action_osc_put`, drop what doesn't fit. The slice is cut
+            // to the room left, so extending it can't fail.
+            let room = self.osc_raw.remaining_capacity();
+            let _ = self.osc_raw.try_extend_from_slice(&bytes[..bytes.len().min(room)]);
+        }
+        #[cfg(feature = "std")]
+        self.osc_raw.extend_from_slice(bytes);
+    }
+
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         self.action_osc_put_param();
         self.osc_dispatch(performer, byte);
@@ -726,17 +800,23 @@ fn is_printable_ascii(byte: u8) -> bool {
 /// Length of the leading run of printable ASCII in `bytes`.
 #[inline]
 fn printable_ascii_run(bytes: &[u8]) -> usize {
+    leading_run(bytes, is_printable_ascii)
+}
+
+/// Length of the leading run of bytes in `bytes` that `pred` accepts.
+#[inline(always)]
+fn leading_run(bytes: &[u8], pred: impl Fn(u8) -> bool) -> usize {
     // Whole blocks are checked without an early exit so the loop vectorizes;
     // the tail and the block that ended the run are scanned byte by byte.
     let mut len = 0;
     for block in bytes.chunks_exact(16) {
-        if !block.iter().all(|&b| is_printable_ascii(b)) {
+        if !block.iter().all(|&b| pred(b)) {
             break;
         }
         len += block.len();
     }
     let tail = &bytes[len..];
-    len + tail.iter().position(|&b| !is_printable_ascii(b)).unwrap_or(tail.len())
+    len + tail.iter().position(|&b| !pred(b)).unwrap_or(tail.len())
 }
 
 #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
@@ -805,7 +885,25 @@ pub trait Perform {
 
     /// Pass bytes as part of a device control string to the handle chosen in
     /// `hook`. C0 controls will also be passed to the handler.
+    ///
+    /// Only called through the default [`Perform::put_slice`].
     fn put(&mut self, _byte: u8) {}
+
+    /// Pass a run of bytes of a device control string to the handler chosen
+    /// in `hook`.
+    ///
+    /// This is equivalent to calling [`Perform::put`] for every byte, which
+    /// is what the default implementation does. Overriding it lets a handler
+    /// take a whole run at once.
+    ///
+    /// One run of data may arrive over several calls, for example when it is
+    /// split across calls to [`Parser::advance`].
+    #[inline]
+    fn put_slice(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.put(byte);
+        }
+    }
 
     /// Called when a device control string is terminated.
     ///
@@ -1679,6 +1777,7 @@ mod tests {
     #[derive(Default)]
     struct RunDispatcher {
         runs: Vec<String>,
+        puts: Vec<Vec<u8>>,
         inner: Dispatcher,
     }
 
@@ -1700,6 +1799,29 @@ mod tests {
         fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
             self.inner.csi_dispatch(params, intermediates, ignore, c);
         }
+
+        fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
+            self.inner.hook(params, intermediates, ignore, c);
+        }
+
+        fn put_slice(&mut self, bytes: &[u8]) {
+            self.puts.push(bytes.to_vec());
+            self.inner.put_slice(bytes);
+        }
+
+        fn unhook(&mut self) {
+            self.inner.unhook();
+        }
+    }
+
+    #[test]
+    fn put_slice_receives_whole_runs() {
+        let mut dispatcher = RunDispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1bPq#0;2\x7f!3~\n-\xff$\x1b\\");
+
+        assert_eq!(dispatcher.puts, [&b"#0;2"[..], b"!3~\n-", b"$"]);
     }
 
     #[test]
@@ -1728,6 +1850,79 @@ mod tests {
             parser.advance(&mut dispatcher, &input[split..]);
 
             assert_eq!(dispatcher.inner.dispatched, expected.dispatched, "split at {split}");
+        }
+    }
+
+    /// Advances one byte at a time through the state machine, bypassing the
+    /// fast paths that handle several bytes at once outside ground.
+    fn advance_bytewise<const N: usize, P: Perform>(
+        parser: &mut Parser<N>,
+        performer: &mut P,
+        bytes: &[u8],
+    ) {
+        for &byte in bytes {
+            if parser.state == State::Ground {
+                parser.advance(performer, &[byte]);
+            } else {
+                parser.change_state(performer, byte);
+            }
+        }
+    }
+
+    /// Sequences that exercise every exit from the CSI, DCS and OSC states.
+    const TRICKY: &[&[u8]] = &[
+        b"\x1b[38;2;1;2;3m\x1b[4:3mx\x1b[m",
+        b"\x1b[?1049h\x1b[>4;2m\x1b[ q\x1b[1 q\x1b[1?h\x1b[1;2<m",
+        b"\x1b[;;3;H\x1b[:1:2m\x1b[99999999999m\x1b[1\x7f2m",
+        b"\x1b[1;\n2H\x1b[1\x1b[2J\x1b[3\x18A\x1b[3\x1aA\x1b[1\xc2\x9b2m",
+        b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;\
+          30;31;32;33;34m",
+        b"\x1b[1:2:3:4:5:6:7:8:9:10:11:12:13:14:15:16:17:18:19:20:21:22:23:24:25:26:27:28:29:\
+          30:31:32:33;34m",
+        b"\x1bPq#0;2;0;0;0#0!12~-\n$\x7f\xff\x9c\x1bP1$r0m\x1b\\\x1bPq??\x18\x1bPq??\x1a\x1bPx\x1b[1m",
+        b"\x1b]0;title\x07\x1b]8;;http://a/b;c\x1b\\\x1b]2;t\xc3\xa9\x01\x1f\x7f;\x07\x1b]1\x18\x1b]1\x1a",
+        b"\x1b];;;;;;;;;;;;;;;;;;;;\x07\x1b]52;c;YWJj\x1b[1m",
+    ];
+
+    #[test]
+    fn fast_paths_match_the_state_machine() {
+        let input = TRICKY.concat();
+
+        let mut expected = Dispatcher::default();
+        advance_bytewise(&mut Parser::new(), &mut expected, &input);
+
+        for split in 0..=input.len() {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+            parser.advance(&mut dispatcher, &input[..split]);
+            parser.advance(&mut dispatcher, &input[split..]);
+
+            assert_eq!(dispatcher.dispatched, expected.dispatched, "split at {split}");
+        }
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        for byte in input.chunks(1) {
+            parser.advance(&mut dispatcher, byte);
+        }
+        assert_eq!(dispatcher.dispatched, expected.dispatched, "one byte per call");
+    }
+
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn fast_paths_match_the_state_machine_when_the_osc_buffer_fills() {
+        let input = TRICKY.concat();
+
+        let mut expected = Dispatcher::default();
+        advance_bytewise(&mut Parser::<4>::new_with_size(), &mut expected, &input);
+
+        for split in 0..=input.len() {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::<4>::new_with_size();
+            parser.advance(&mut dispatcher, &input[..split]);
+            parser.advance(&mut dispatcher, &input[split..]);
+
+            assert_eq!(dispatcher.dispatched, expected.dispatched, "split at {split}");
         }
     }
 }
