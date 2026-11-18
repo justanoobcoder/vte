@@ -639,6 +639,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             pos = printable_ascii_run(&bytes[..plain_chars]);
             // SAFETY: printable ASCII is valid UTF-8.
             performer.print_ascii(unsafe { str::from_utf8_unchecked(&bytes[..pos]) });
+            if pos == plain_chars {
+                return self.end_ground(plain_chars, num_bytes);
+            }
         }
 
         // Dispatch everything up to the escape. Invalid UTF-8 is skipped in
@@ -690,6 +693,13 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             }
         }
 
+        self.end_ground(plain_chars, num_bytes)
+    }
+
+    /// Ends a ground segment of `plain_chars` bytes out of `num_bytes`.
+    /// Returns the number of bytes consumed.
+    #[inline(always)]
+    fn end_ground(&mut self, plain_chars: usize, num_bytes: usize) -> usize {
         // If there's another character, it must be escape so process it
         // directly.
         if plain_chars < num_bytes {
@@ -1847,6 +1857,22 @@ mod tests {
         Parser::new().advance(&mut dispatcher, input);
 
         assert_eq!(dispatcher.dispatched, expected.dispatched);
+    }
+
+    #[test]
+    fn ground_after_leading_ascii() {
+        let mut dispatcher = RunDispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, "a\u{85}b0123456789abcdefghé\x1b[m".as_bytes());
+        parser.advance(&mut dispatcher, b"c\x85d");
+
+        assert_eq!(dispatcher.runs, ["a", "b0123456789abcdefgh", "c", "d"]);
+        let expected = [Sequence::Print('a'), Sequence::Execute(0x85), Sequence::Print('b')];
+        assert_eq!(dispatcher.inner.dispatched[..3], expected);
+        assert_eq!(dispatcher.inner.dispatched[21], Sequence::Print('é'));
+        let tail = &dispatcher.inner.dispatched[dispatcher.inner.dispatched.len() - 3..];
+        assert_eq!(tail, [Sequence::Print('c'), Sequence::Execute(0x85), Sequence::Print('d')]);
     }
 
     #[test]
