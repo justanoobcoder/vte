@@ -8,9 +8,9 @@ CHANGELOG
 - C1 controls split across calls to `advance` are executed instead of printed
 - Bytes following a character completed from the partial-UTF-8 buffer are no longer dropped
 - CAN and SUB abandon an OSC string instead of dispatching it truncated
-- CSI parameters are parsed in a tight loop instead of one state change per byte
+- Faster CSI parsing
 - Add `Perform::put_slice`, which receives runs of device control string data at once
-- OSC strings are copied in runs instead of byte by byte
+- Faster OSC and DCS parsing
 - `ParamsIter::size_hint` lower bound no longer counts subparameters
 - Removed the `ansi` module, the `ansi` and `serde` features, `Parser::advance_until_terminated` and `Perform::terminated`
 
