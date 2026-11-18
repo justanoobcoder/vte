@@ -1860,6 +1860,29 @@ mod tests {
     }
 
     #[test]
+    fn all_ascii_ground_segments() {
+        let mut dispatcher = RunDispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"abc\x1b[1m");
+        parser.advance(&mut dispatcher, b"xyz");
+        assert_eq!(parser.state, State::Ground);
+        parser.advance(&mut dispatcher, b"\xc3\xa9");
+
+        assert_eq!(dispatcher.runs, ["abc", "xyz"]);
+        assert_eq!(
+            dispatcher.inner.dispatched[3..],
+            [
+                Sequence::Csi(vec![vec![1]], vec![], false, 'm'),
+                Sequence::Print('x'),
+                Sequence::Print('y'),
+                Sequence::Print('z'),
+                Sequence::Print('é'),
+            ]
+        );
+    }
+
+    #[test]
     fn ground_after_leading_ascii() {
         let mut dispatcher = RunDispatcher::default();
         let mut parser = Parser::new();
