@@ -115,6 +115,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     i += self.advance_csi_params(performer, &bytes[i..])
                 },
                 State::DcsPassthrough => i += self.advance_dcs_data(performer, &bytes[i..]),
+                State::OscString => i += self.advance_osc_data(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -184,6 +185,20 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             return 1;
         }
         performer.put_slice(&bytes[..run]);
+        run
+    }
+
+    /// Advance through an OSC string, copying each run of it between
+    /// separators and controls at once. Returns the number of bytes consumed.
+    #[inline]
+    fn advance_osc_data<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        // The bytes `advance_osc_string` stores, except separators.
+        let run = leading_run(bytes, |b| b >= 0x20 && b != b';');
+        if run == 0 {
+            self.advance_osc_string(performer, bytes[0]);
+            return 1;
+        }
+        self.action_osc_put_slice(&bytes[..run]);
         run
     }
 
@@ -554,6 +569,19 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             }
         }
         self.osc_raw.push(byte);
+    }
+
+    #[inline]
+    fn action_osc_put_slice(&mut self, bytes: &[u8]) {
+        #[cfg(not(feature = "std"))]
+        {
+            // Like `action_osc_put`, drop what doesn't fit. The slice is cut
+            // to the room left, so extending it can't fail.
+            let room = self.osc_raw.remaining_capacity();
+            let _ = self.osc_raw.try_extend_from_slice(&bytes[..bytes.len().min(room)]);
+        }
+        #[cfg(feature = "std")]
+        self.osc_raw.extend_from_slice(bytes);
     }
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
