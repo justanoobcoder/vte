@@ -885,6 +885,8 @@ pub trait Perform {
 
     /// Pass bytes as part of a device control string to the handle chosen in
     /// `hook`. C0 controls will also be passed to the handler.
+    ///
+    /// Only called through the default [`Perform::put_slice`].
     fn put(&mut self, _byte: u8) {}
 
     /// Pass a run of bytes of a device control string to the handler chosen
@@ -1897,6 +1899,13 @@ mod tests {
 
             assert_eq!(dispatcher.dispatched, expected.dispatched, "split at {split}");
         }
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        for byte in input.chunks(1) {
+            parser.advance(&mut dispatcher, byte);
+        }
+        assert_eq!(dispatcher.dispatched, expected.dispatched, "one byte per call");
     }
 
     #[cfg(not(feature = "std"))]
