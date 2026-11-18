@@ -9,6 +9,7 @@ CHANGELOG
 - Bytes following a character completed from the partial-UTF-8 buffer are no longer dropped
 - CAN and SUB abandon an OSC string instead of dispatching it truncated
 - CSI parameters are parsed in a tight loop instead of one state change per byte
+- Add `Perform::put_slice`, which receives runs of device control string data at once
 - `ParamsIter::size_hint` lower bound no longer counts subparameters
 - Removed the `ansi` module, the `ansi` and `serde` features, `Parser::advance_until_terminated` and `Perform::terminated`
 
