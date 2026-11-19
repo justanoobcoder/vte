@@ -15,6 +15,7 @@ CHANGELOG
 - Faster parsing of plain text between escape sequences
 - `ParamsIter::size_hint` lower bound no longer counts subparameters
 - Removed the `ansi` module, the `ansi` and `serde` features, `Parser::advance_until_terminated` and `Perform::terminated`
+- Add `Parser::is_idle`, which tells whether the parser is in neither an escape nor a UTF-8 sequence
 
 ## 0.15.0
 
@@ -53,9 +54,9 @@ CHANGELOG
 ## 0.11.1
 
 - Minimum rust version has been bumped to 1.62.1
-- Support for ANSI terminal stream parsing under the `ansi` feature.
+- Support for ANSI terminal stream parsing under the `ansi` feature
 - Addition of the `serde` feature which derives `Serialize` and `Deserialize`
-  for the types provided in the `ansi` module.
+    for the types provided in the `ansi` module
 
 ## 0.11.0
 
@@ -107,7 +108,7 @@ CHANGELOG
 ## 0.3.3
 
 - Fix off-by-one error in CSI parsing when params list was at max length
-  (previously caused a panic).
+    (previously caused a panic)
 - Support no_std
 
 ## 0.2.0
@@ -115,4 +116,4 @@ CHANGELOG
 - Removes `osc_start`, `osc_put`, and `osc_end`
 - Adds `osc_dispatch` which simply receives a list of parameters
 - Removes `byte: u8` parameter from `hook` and `unhook` because it's always
-  zero.
+    zero
