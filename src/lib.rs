@@ -774,7 +774,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     /// Handle ground dispatch of print/execute for all characters in a string.
     ///
-    /// Runs of printable ASCII go to [`Perform::print_ascii`] in one call.
+    /// Runs of printable ASCII go to [`Perform::print_ascii`] in one call, and
+    /// runs of other printable characters to [`Perform::print_text`].
     #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, mut text: &str) {
         while !text.is_empty() {
@@ -787,12 +788,20 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 continue;
             }
 
+            let run = non_ascii_text_run(text.as_bytes());
+            if run > 0 {
+                // The run ends before an ASCII byte or the lead byte of a C1
+                // control, so on a char boundary.
+                let (run, rest) = text.split_at(run);
+                performer.print_text(run);
+                text = rest;
+                continue;
+            }
+
+            // A C0 or C1 control, or DEL.
             let mut chars = text.chars();
-            while let Some(c) = chars.next() {
+            if let Some(c) = chars.next() {
                 Self::dispatch_char(performer, c);
-                if matches!(chars.as_str().bytes().next(), Some(b) if is_printable_ascii(b)) {
-                    break;
-                }
             }
             text = chars.as_str();
         }
@@ -819,6 +828,17 @@ fn is_printable_ascii(byte: u8) -> bool {
 #[inline]
 fn printable_ascii_run(bytes: &[u8]) -> usize {
     leading_run(bytes, is_printable_ascii)
+}
+
+/// Length of the leading run of non-ASCII characters in `bytes` that are not C1
+/// controls.
+#[inline]
+fn non_ascii_text_run(bytes: &[u8]) -> usize {
+    let run = leading_run(bytes, |byte| byte >= 0x80);
+    // C1 controls, U+0080 through U+009F, are encoded as C2 80 through C2 9F.
+    memchr::memchr_iter(0xC2, &bytes[..run])
+        .find(|&i| matches!(bytes.get(i + 1), Some(0x80..=0x9F)))
+        .unwrap_or(run)
 }
 
 /// Length of the leading run of bytes in `bytes` that `pred` accepts.
@@ -880,6 +900,23 @@ pub trait Perform {
     /// split across calls to [`Parser::advance`].
     #[inline]
     fn print_ascii(&mut self, text: &str) {
+        for c in text.chars() {
+            self.print(c);
+        }
+    }
+
+    /// Draw a run of characters outside ASCII, none of them a C1 control, to
+    /// the screen.
+    ///
+    /// This is equivalent to calling [`Perform::print`] for every character
+    /// in `text`, which is what the default implementation does. Overriding
+    /// it lets a performer write a whole run at once.
+    ///
+    /// One run of text may arrive over several calls, for example when it is
+    /// split across calls to [`Parser::advance`], and characters completed
+    /// across calls still go to [`Perform::print`].
+    #[inline]
+    fn print_text(&mut self, text: &str) {
         for c in text.chars() {
             self.print(c);
         }
@@ -1741,6 +1778,19 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_text_run_lengths() {
+        assert_eq!(non_ascii_text_run(b""), 0);
+        assert_eq!(non_ascii_text_run(b"a\xC3\xA9"), 0);
+        assert_eq!(non_ascii_text_run("éü€😀".as_bytes()), 11);
+        assert_eq!(non_ascii_text_run("é€a".as_bytes()), 5);
+        // A C1 control ends it, other characters encoded with C2 don't.
+        assert_eq!(non_ascii_text_run("é¡\u{85}ü".as_bytes()), 4);
+        assert_eq!(non_ascii_text_run("\u{9F}é".as_bytes()), 0);
+        let long = "日本語".repeat(10);
+        assert_eq!(non_ascii_text_run(long.as_bytes()), long.len());
+    }
+
+    #[test]
     fn printable_ascii_run_lengths() {
         let long = [b'a'; 40];
         assert_eq!(printable_ascii_run(&long), 40);
@@ -1790,11 +1840,12 @@ mod tests {
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
     }
 
-    /// Records ASCII runs as they arrive, and everything else like
-    /// `Dispatcher`.
+    /// Records ASCII and other text runs as they arrive, and everything else
+    /// like `Dispatcher`.
     #[derive(Default)]
     struct RunDispatcher {
         runs: Vec<String>,
+        texts: Vec<String>,
         puts: Vec<Vec<u8>>,
         inner: Dispatcher,
     }
@@ -1804,6 +1855,15 @@ mod tests {
             assert!(text.bytes().all(is_printable_ascii), "{text:?}");
             self.runs.push(text.into());
             self.inner.print_ascii(text);
+        }
+
+        fn print_text(&mut self, text: &str) {
+            assert!(
+                text.chars().all(|c| !c.is_ascii() && !('\u{80}'..='\u{9F}').contains(&c)),
+                "{text:?}"
+            );
+            self.texts.push(text.into());
+            self.inner.print_text(text);
         }
 
         fn print(&mut self, c: char) {
@@ -1909,8 +1969,19 @@ mod tests {
     }
 
     #[test]
+    fn print_text_receives_whole_runs() {
+        let mut dispatcher = RunDispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, "日本 語é\u{85}ü€\x1b[1m😀\x7f¡".as_bytes());
+
+        assert_eq!(dispatcher.texts, ["日本", "語é", "ü€", "😀", "¡"]);
+        assert_eq!(dispatcher.runs, [" "]);
+    }
+
+    #[test]
     fn print_ascii_matches_printing_each_char() {
-        let input = b"plain \x1b[31mred\x1b[0m t\xc3\xa9xt \xf0\x9f\x98\x80!\r\n\x7f\xc2\x85\xc3";
+        let input = b"plain \x1b[31mred\x1b[0m t\xc3\xa9xt \xc2\xa1\xc2\x85\xc3\xa9 \xf0\x9f\x98\x80!\r\n\x7f\xc2\x85\xc3";
 
         for split in 0..=input.len() {
             let mut expected = Dispatcher::default();

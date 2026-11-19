@@ -4,6 +4,7 @@ CHANGELOG
 ## Unreleased
 
 - Add `Perform::print_ascii`, which receives runs of printable ASCII at once
+- Add `Perform::print_text`, which receives runs of other printable characters at once
 - Invalid UTF-8 in ground no longer rescans the rest of the buffer, which was quadratic
 - C1 controls split across calls to `advance` are executed instead of printed
 - Bytes following a character completed from the partial-UTF-8 buffer are no longer dropped
